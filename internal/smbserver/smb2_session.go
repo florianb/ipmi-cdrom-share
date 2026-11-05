@@ -14,7 +14,7 @@ const (
 	smb2Dialect210      = 0x0210
 	smb2Dialect300      = 0x0300
 	smb2Dialect302      = 0x0302
-	smb2DialectWildcard = 0x02FF // answer to "SMB 2.???"; the client renegotiates
+	smb2DialectWildcard = 0x02FF // only in the response to "SMB 2.???"; the client renegotiates
 )
 
 // smb2DialectPreference prefers the simplest dialect a client offers. 3.1.1 is
@@ -40,6 +40,7 @@ type smb2ClientInfo struct {
 	guid         [16]byte
 }
 
+// chooseSMB2Dialect returns the most preferred dialect in offered, or 0 for none.
 func chooseSMB2Dialect(offered []uint16) uint16 {
 	for _, preferred := range smb2DialectPreference {
 		for _, d := range offered {
@@ -51,9 +52,12 @@ func chooseSMB2Dialect(offered []uint16) uint16 {
 	return 0
 }
 
-func (c *smb2Conn) handleNegotiate(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleNegotiate handles NEGOTIATE ([MS-SMB2] 2.2.3). It reads DialectCount at 2,
+// SecurityMode at 4, Capabilities at 8, ClientGuid at 12 and Dialects at 36. Only a
+// failed attempt or the wildcard answer may be followed by another NEGOTIATE.
+func (c *smb2Conn) handleNegotiate(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	if c.dialect != 0 && c.dialect != smb2DialectWildcard {
-		c.fatal = fmt.Errorf("%w: repeated NEGOTIATE", errSMB2Protocol)
+		c.fatal = fmt.Errorf("%w: repeated NEGOTIATE", errProtocolViolation)
 		return out, statusInvalidParameter
 	}
 
@@ -87,7 +91,8 @@ func (c *smb2Conn) handleNegotiate(req *smb2Request, out []byte) ([]byte, uint32
 	return c.appendNegotiateBody(out, dialect), statusOK
 }
 
-// appendNegotiateBody appends a NEGOTIATE response. No capability is advertised:
+// appendNegotiateBody appends a NEGOTIATE response ([MS-SMB2] 2.2.4). Signing is
+// announced as enabled but not required, which guest sessions never use. No capability is advertised:
 // without LARGE_MTU every operation costs one credit and reads stay at 64 KiB.
 func (c *smb2Conn) appendNegotiateBody(out []byte, dialect uint16) []byte {
 	const bufferOffset = 64
@@ -106,8 +111,8 @@ func (c *smb2Conn) appendNegotiateBody(out []byte, dialect uint16) []byte {
 	return out
 }
 
-// serveMultiProtocolNegotiate answers an SMB1 NEGOTIATE with an SMB2 one. The
-// response always has MessageId 0.
+// serveMultiProtocolNegotiate answers an SMB1 NEGOTIATE with an SMB2 one
+// ([MS-SMB2] 3.3.5.3). The response always has MessageId 0.
 func (c *smb2Conn) serveMultiProtocolNegotiate(w io.Writer, dialect uint16) error {
 	c.dialect = dialect
 	out := make([]byte, frameHeaderSize+smb2HeaderSize, 256)
@@ -120,9 +125,12 @@ func (c *smb2Conn) serveMultiProtocolNegotiate(w io.Writer, dialect uint16) erro
 	return nil
 }
 
-// handleSessionSetup runs the two-step guest logon: NTLMSSP NEGOTIATE gets a
-// CHALLENGE, and any AUTHENTICATE is accepted unchecked as guest.
-func (c *smb2Conn) handleSessionSetup(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleSessionSetup handles SESSION_SETUP ([MS-SMB2] 2.2.5), reading Flags at 2,
+// SecurityBufferOffset at 12 and SecurityBufferLength at 14. It runs the two-step guest
+// logon: NTLMSSP NEGOTIATE gets a CHALLENGE, and any AUTHENTICATE is accepted unchecked
+// as guest. Without a session key the session cannot sign, and the guest flag in the
+// response (2.2.6) tells the client not to expect it.
+func (c *smb2Conn) handleSessionSetup(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	if req.body[2]&smb2SessionFlagBinding != 0 {
 		return out, statusRequestNotAccepted // no multichannel
 	}
@@ -144,7 +152,7 @@ func (c *smb2Conn) handleSessionSetup(req *smb2Request, out []byte) ([]byte, uin
 
 	var sessionFlags uint16
 	var reply []byte
-	var status uint32
+	var status ntStatus
 	switch tok.messageType {
 	case ntlmMessageNegotiate:
 		if sess == nil {
@@ -192,23 +200,29 @@ func (c *smb2Conn) handleSessionSetup(req *smb2Request, out []byte) ([]byte, uin
 	return out, status
 }
 
-func (c *smb2Conn) handleLogoff(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleLogoff handles LOGOFF ([MS-SMB2] 2.2.7) and closes the handles of the session.
+func (c *smb2Conn) handleLogoff(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	id := req.sessionID
 	delete(c.sessions, id)
 	c.dropHandles(func(h *smb2Handle) bool { return h.sessionID == id })
 	return appendSmallBody(out), statusOK
 }
 
-func (c *smb2Conn) handleEcho(_ *smb2Request, out []byte) ([]byte, uint32) {
+// handleEcho handles ECHO ([MS-SMB2] 2.2.28).
+func (c *smb2Conn) handleEcho(_ *smb2Request, out []byte) ([]byte, ntStatus) {
 	return appendSmallBody(out), statusOK
 }
 
-// appendSmallBody appends the 4-byte response shared by several commands.
+// appendSmallBody appends the 4-byte response shared by LOGOFF, ECHO and
+// TREE_DISCONNECT ([MS-SMB2] 2.2.8, 2.2.29 and 2.2.12).
 func appendSmallBody(out []byte) []byte {
 	return append(out, 4, 0, 0, 0)
 }
 
-func (c *smb2Conn) handleTreeConnect(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleTreeConnect handles TREE_CONNECT ([MS-SMB2] 2.2.9). It reads PathOffset at 4
+// and PathLength at 6. The response (2.2.10) holds ShareType at 2 and MaximalAccess at
+// 12. Clients connect to IPC$ on their own, so it has to succeed as a pipe share.
+func (c *smb2Conn) handleTreeConnect(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	path, ok := req.payload(uint32(le.Uint16(req.body[4:])), uint32(le.Uint16(req.body[6:])))
 	if !ok {
 		return out, statusInvalidParameter
@@ -238,7 +252,9 @@ func (c *smb2Conn) handleTreeConnect(req *smb2Request, out []byte) ([]byte, uint
 	return out, statusOK
 }
 
-func (c *smb2Conn) handleTreeDisconnect(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleTreeDisconnect handles TREE_DISCONNECT ([MS-SMB2] 2.2.11) and closes the
+// handles of the tree.
+func (c *smb2Conn) handleTreeDisconnect(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	sessionID, treeID := req.sessionID, req.treeID
 	delete(c.sessions[sessionID].trees, treeID)
 	c.dropHandles(func(h *smb2Handle) bool { return h.sessionID == sessionID && h.treeID == treeID })

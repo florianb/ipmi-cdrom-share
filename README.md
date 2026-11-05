@@ -1,6 +1,6 @@
 # ipmi-cdrom-share
 
-Serve an ISO over SMB for IPMI/BMC virtual media. Single binary, zero config, zero dependencies.
+Serve an ISO over SMB for IPMI/BMC virtual media. Single binary, zero config, no dependencies beyond the Go standard library.
 
 BMC virtual media clients often speak only one old SMB dialect: many (Supermicro, Dell iDRAC, HP iLO) only support SMB1, others only a single SMB 3.x version. Running a full Samba install to share one read-only file is overkill. This does the minimum needed and supports SMB1 (NT LM 0.12) and SMB 2.0.2, 2.1, 3.0 and 3.0.2.
 
@@ -79,6 +79,24 @@ go test -run='^$' -fuzz=FuzzSMB2ServeFrame -fuzztime=1m ./internal/smbserver
 go test -run='^$' -fuzz=FuzzSMB1Dispatch -fuzztime=1m ./internal/smbserver
 ```
 
+### Acceptance tests
+
+The tests in `acceptance/` build the real binary, start it on a free local port and talk to it from the outside. They use [go-smb2](https://github.com/hirochachacha/go-smb2) as an independent client and cover downloads over all four dialects, reads above 4 GiB, read-only behaviour, concurrent clients, shutdown on SIGTERM and exit codes. They are a separate Go module, so `go test ./...` in the main module does not run them:
+
+```bash
+(cd acceptance && go test -race ./...)
+```
+
+### SMB1 wire format
+
+go-smb2 does not speak SMB1. `TestSMB1WireFormat` therefore runs the BMC sequence and every handler branch and compares each response byte for byte with `internal/smbserver/testdata/smb1_wire.golden`; only timestamps are masked. BMC firmware is picky, so this file must only change together with a deliberate wire format change:
+
+```bash
+go test -run=TestSMB1WireFormat ./internal/smbserver -args -update-smb1-wire
+```
+
+### Manual tests
+
 With a real client, on a test port:
 
 ```bash
@@ -95,7 +113,7 @@ sudo mount -t cifs //localhost/share /mnt -o vers=3.02,guest,ro
 sha256sum /path/to/original.iso /mnt/original.iso
 ```
 
-`smbclient` (checked with 4.19) cannot test the SMB1 path: it rejects the SMB1 NEGOTIATE response with `NT_STATUS_INVALID_PARAMETER`. `TestE2ESMB1` covers this path instead.
+`smbclient` (checked with 4.19) cannot test the SMB1 path: it rejects the SMB1 NEGOTIATE response with `NT_STATUS_INVALID_PARAMETER`. `TestE2ESMB1` and `TestSMB1WireFormat` cover this path instead, but only with the project's own test client.
 
 ## Tested BMCs
 
@@ -103,7 +121,7 @@ sha256sum /path/to/original.iso /mnt/original.iso
 
 ## Building
 
-Requires Go 1.22+. No external dependencies.
+Requires Go 1.22+. The binary and the main module have no external dependencies; only the separate test module in `acceptance/` requires go-smb2.
 
 ```bash
 go build -o ipmi-cdrom-share .

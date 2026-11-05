@@ -1,19 +1,10 @@
 package smbserver
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
-	"time"
 )
-
-var le = binary.LittleEndian
-
-// errSMB2Protocol reports a client violating the protocol badly enough that the
-// connection has to be dropped.
-var errSMB2Protocol = errors.New("SMB protocol violation")
 
 const (
 	smb2HeaderSize        = 64
@@ -49,33 +40,6 @@ const (
 	smb2FlagRelated       = 0x00000004
 )
 
-// Further NT status codes used by SMB2. The SMB1 code defines the ones it needs.
-const (
-	statusBufferOverflow         = 0x80000005
-	statusNoMoreFiles            = 0x80000006
-	statusInvalidInfoClass       = 0xC0000003
-	statusInfoLengthMismatch     = 0xC0000004
-	statusInvalidParameter       = 0xC000000D
-	statusNoSuchFile             = 0xC000000F
-	statusInvalidDeviceRequest   = 0xC0000010
-	statusEndOfFile              = 0xC0000011
-	statusMoreProcessingRequired = 0xC0000016
-	statusAccessDenied           = 0xC0000022
-	statusBufferTooSmall         = 0xC0000023
-	statusObjectNameCollision    = 0xC0000035
-	statusLogonFailure           = 0xC000006D
-	statusInsufficientResources  = 0xC000009A
-	statusFileIsADirectory       = 0xC00000BA
-	statusNotSupported           = 0xC00000BB
-	statusNetworkNameDeleted     = 0xC00000C9
-	statusRequestNotAccepted     = 0xC00000D0
-	statusUnexpectedIOError      = 0xC00000E9
-	statusNotADirectory          = 0xC0000103
-	statusFileClosed             = 0xC0000128
-	statusFSDriverRequired       = 0xC000019C
-	statusUserSessionDeleted     = 0xC0000203
-)
-
 const (
 	// smb2MaxCredits caps the credits granted per response.
 	smb2MaxCredits = 128
@@ -94,7 +58,7 @@ const (
 	smb2AllOnes = ^uint64(0)
 )
 
-// smb2Header is the 64-byte SMB2 header. Status and signature are not parsed:
+// smb2Header is the 64-byte SMB2 header ([MS-SMB2] 2.2.1). Status and signature are not parsed:
 // requests carry a channel sequence in the status field, and guest sessions are
 // never signed.
 type smb2Header struct {
@@ -116,6 +80,8 @@ type smb2Request struct {
 	body []byte // msg without the header
 }
 
+// related reports whether the message continues a compound chain and inherits IDs
+// from its predecessor ([MS-SMB2] 3.2.4.1.4).
 func (r *smb2Request) related() bool { return r.flags&smb2FlagRelated != 0 }
 
 // payload returns a variable-size request field addressed by offset and length.
@@ -132,13 +98,13 @@ func (r *smb2Request) payload(offset, length uint32) ([]byte, bool) {
 // parseSMB2Message splits the first message off data and returns the remainder.
 func parseSMB2Message(data []byte) (*smb2Request, []byte, error) {
 	if len(data) < smb2HeaderSize {
-		return nil, nil, fmt.Errorf("%w: SMB2 message of %d bytes", errSMB2Protocol, len(data))
+		return nil, nil, fmt.Errorf("%w: SMB2 message of %d bytes", errProtocolViolation, len(data))
 	}
-	if [4]byte(data[:4]) != [4]byte{0xFE, 'S', 'M', 'B'} {
-		return nil, nil, fmt.Errorf("%w: compound element with identifier % x", errSMB2Protocol, data[:4])
+	if [4]byte(data[:4]) != smb2Magic {
+		return nil, nil, fmt.Errorf("%w: compound element with identifier % x", errProtocolViolation, data[:4])
 	}
 	if size := le.Uint16(data[4:]); size != smb2HeaderSize {
-		return nil, nil, fmt.Errorf("%w: SMB2 header size %d", errSMB2Protocol, size)
+		return nil, nil, fmt.Errorf("%w: SMB2 header size %d", errProtocolViolation, size)
 	}
 
 	req := &smb2Request{smb2Header: smb2Header{
@@ -157,7 +123,7 @@ func parseSMB2Message(data []byte) (*smb2Request, []byte, error) {
 	end := len(data)
 	if next := req.nextCommand; next != 0 {
 		if next < smb2HeaderSize || next%8 != 0 || uint64(next) > uint64(len(data)) {
-			return nil, nil, fmt.Errorf("%w: NextCommand %d in %d byte frame", errSMB2Protocol, next, len(data))
+			return nil, nil, fmt.Errorf("%w: NextCommand %d in %d byte frame", errProtocolViolation, next, len(data))
 		}
 		end = int(next)
 		rest = data[end:]
@@ -172,24 +138,31 @@ type smb2FileID struct {
 	persistent, volatile uint64
 }
 
+// parseSMB2FileID reads a 16-byte FileId field.
 func parseSMB2FileID(b []byte) smb2FileID {
 	return smb2FileID{persistent: le.Uint64(b), volatile: le.Uint64(b[8:])}
 }
 
+// put writes the 16-byte FileId field to b.
 func (id smb2FileID) put(b []byte) {
 	le.PutUint64(b, id.persistent)
 	le.PutUint64(b[8:], id.volatile)
 }
 
+// smb2Session is one session of a connection. It exists from the first logon step
+// but is only usable once authenticated is set.
 type smb2Session struct {
 	authenticated bool
 	trees         map[uint32]*smb2Tree
 }
 
+// smb2Tree is one tree connect. On a pipe tree (IPC$) every open fails.
 type smb2Tree struct {
 	isPipe bool
 }
 
+// smb2Handle is one open of the file or the root directory, valid only within the
+// session and tree that created it.
 type smb2Handle struct {
 	id         smb2FileID
 	sessionID  uint64
@@ -205,7 +178,7 @@ type smb2Compound struct {
 	treeID       uint32
 	fileID       smb2FileID
 	hasFile      bool
-	createStatus uint32 // status of a failed CREATE, which fails the related requests after it
+	createStatus ntStatus // status of a failed CREATE, which fails the related requests after it
 }
 
 // smb2Conn is the SMB2 state of one connection.
@@ -228,6 +201,7 @@ type smb2Conn struct {
 	ioNs      int64 // time spent on it, tracked only in debug mode
 }
 
+// newSMB2Conn returns the SMB2 state for a new connection to s from remote.
 func newSMB2Conn(s *Server, remote string) *smb2Conn {
 	return &smb2Conn{
 		srv:      s,
@@ -247,9 +221,10 @@ const (
 )
 
 // smb2Handler appends a response body to out and returns the status. On a failure
-// status (see smb2StatusHasBody) the appended bytes are replaced by an error body.
-type smb2Handler func(c *smb2Conn, req *smb2Request, out []byte) ([]byte, uint32)
+// status (see ntStatus.hasBody) the appended bytes are replaced by an error body.
+type smb2Handler func(c *smb2Conn, req *smb2Request, out []byte) ([]byte, ntStatus)
 
+// smb2Command describes how a command is checked and handled.
 type smb2Command struct {
 	name string
 	// structureSize is the request's StructureSize field, or 0 for commands that
@@ -281,16 +256,11 @@ var smb2Commands = map[uint16]smb2Command{
 	smb2OplockBreak:  {"OPLOCK_BREAK", 0, scopeTree, rejectWith(statusNotSupported)},
 }
 
-func rejectWith(status uint32) smb2Handler {
-	return func(_ *smb2Conn, _ *smb2Request, out []byte) ([]byte, uint32) {
+// rejectWith returns a handler that fails with status without looking at the body.
+func rejectWith(status ntStatus) smb2Handler {
+	return func(_ *smb2Conn, _ *smb2Request, out []byte) ([]byte, ntStatus) {
 		return out, status
 	}
-}
-
-// smb2StatusHasBody reports whether a response with this status keeps its
-// regular body instead of the error body.
-func smb2StatusHasBody(status uint32) bool {
-	return status == statusOK || status == statusMoreProcessingRequired || status == statusBufferOverflow
 }
 
 // growZero extends out by n zero bytes and returns the extended slice and the new part.
@@ -301,12 +271,12 @@ func growZero(out []byte, n int) (extended, part []byte) {
 }
 
 // serveFrame processes one frame, which may hold several compounded messages, and
-// writes all responses as one frame.
+// writes all responses as one frame. NextCommand links the responses and each starts
+// on an 8-byte boundary. A frame without responses, which only CANCEL requests
+// produce, writes nothing.
 func (c *smb2Conn) serveFrame(w io.Writer, frame []byte) error {
-	var t0 time.Time
-	if c.srv.debug != nil {
-		t0 = time.Now()
-	}
+	debug := c.srv.debug
+	start := debug.now()
 
 	bp := readBufPool.Get().(*[]byte)
 	defer readBufPool.Put(bp)
@@ -324,7 +294,7 @@ func (c *smb2Conn) serveFrame(w io.Writer, frame []byte) error {
 		rest = next
 
 		// Nothing is ever pending, so there is nothing to cancel, and CANCEL
-		// itself has no response.
+		// ([MS-SMB2] 2.2.30) itself has no response.
 		if req.command == smb2Cancel {
 			continue
 		}
@@ -338,7 +308,7 @@ func (c *smb2Conn) serveFrame(w io.Writer, frame []byte) error {
 		headerStart := len(out)
 		out, _ = growZero(out, smb2HeaderSize)
 
-		var status uint32
+		var status ntStatus
 		out, status = c.dispatch(req, out, len(rest) > 0)
 		if c.fatal != nil {
 			return c.fatal
@@ -352,21 +322,10 @@ func (c *smb2Conn) serveFrame(w io.Writer, frame []byte) error {
 
 	putFrameHeader(out, frameTypeSessionMessage, len(out)-frameHeaderSize)
 
-	var writeStart time.Time
-	if c.srv.debug != nil {
-		writeStart = time.Now()
-	}
+	writeStart := debug.now()
 	_, err := w.Write(out)
-	if d := c.srv.debug; d != nil && c.readBytes > 0 {
-		end := time.Now()
-		total := end.Sub(t0).Nanoseconds()
-		d.requests.Add(1)
-		d.fileBytes.Add(c.readBytes)
-		d.handlerNs.Add(total)
-		d.ioNs.Add(c.ioNs)
-		d.writeNs.Add(end.Sub(writeStart).Nanoseconds())
-		d.recordLatency(total)
-		d.recordSize(int(c.readBytes))
+	if c.readBytes > 0 {
+		debug.observe(start, writeStart, c.ioNs, c.readBytes)
 	}
 	if err != nil {
 		return fmt.Errorf("write: %w", err)
@@ -376,11 +335,11 @@ func (c *smb2Conn) serveFrame(w io.Writer, frame []byte) error {
 
 // putSMB2ResponseHeader fills the response header for req. Handlers may have
 // updated req's session and tree IDs.
-func putSMB2ResponseHeader(h []byte, req *smb2Header, status uint32) {
-	copy(h, []byte{0xFE, 'S', 'M', 'B'})
+func putSMB2ResponseHeader(h []byte, req *smb2Header, status ntStatus) {
+	copy(h, smb2Magic[:])
 	le.PutUint16(h[4:], smb2HeaderSize)
 	le.PutUint16(h[6:], req.creditCharge)
-	le.PutUint32(h[8:], status)
+	le.PutUint32(h[8:], uint32(status))
 	le.PutUint16(h[12:], req.command)
 	le.PutUint16(h[14:], min(max(req.creditRequest, 1), smb2MaxCredits))
 	le.PutUint32(h[16:], smb2FlagServerToRedir|req.flags&smb2FlagRelated)
@@ -391,7 +350,7 @@ func putSMB2ResponseHeader(h []byte, req *smb2Header, status uint32) {
 }
 
 // dispatch appends the body of the response to req and returns the status.
-func (c *smb2Conn) dispatch(req *smb2Request, out []byte, more bool) ([]byte, uint32) {
+func (c *smb2Conn) dispatch(req *smb2Request, out []byte, more bool) ([]byte, ntStatus) {
 	cmd, known := smb2Commands[req.command]
 	name := cmd.name
 	if !known {
@@ -400,7 +359,7 @@ func (c *smb2Conn) dispatch(req *smb2Request, out []byte, more bool) ([]byte, ui
 
 	bodyStart := len(out)
 	out, status := c.execute(req, cmd, known, out, more)
-	if !smb2StatusHasBody(status) {
+	if !status.hasBody() {
 		out = append(out[:bodyStart], smb2ErrorBody[:]...)
 	}
 
@@ -415,18 +374,22 @@ func (c *smb2Conn) dispatch(req *smb2Request, out []byte, more bool) ([]byte, ui
 	return out, status
 }
 
-// smb2ErrorBody is the ERROR response: StructureSize 9, no error data, and the one
+// smb2ErrorBody is the ERROR response ([MS-SMB2] 2.2.2): StructureSize 9, no error data, and the one
 // byte of ErrorData required when ByteCount is 0.
 var smb2ErrorBody = [9]byte{9}
 
-func (c *smb2Conn) execute(req *smb2Request, cmd smb2Command, known bool, out []byte, more bool) ([]byte, uint32) {
+// execute runs all checks common to the commands and then the handler: NEGOTIATE
+// comes first and alone, related messages inherit the session and tree and the failure
+// of an earlier CREATE, the response stays bounded, the body has its StructureSize,
+// and the session and tree that the command's scope requires exist.
+func (c *smb2Conn) execute(req *smb2Request, cmd smb2Command, known bool, out []byte, more bool) ([]byte, ntStatus) {
 	if req.command == smb2Negotiate {
 		if c.compound.started || more {
-			c.fatal = fmt.Errorf("%w: compounded NEGOTIATE", errSMB2Protocol)
+			c.fatal = fmt.Errorf("%w: compounded NEGOTIATE", errProtocolViolation)
 			return out, statusInvalidParameter
 		}
 	} else if c.dialect == 0 || c.dialect == smb2DialectWildcard {
-		c.fatal = fmt.Errorf("%w: command 0x%02X before NEGOTIATE", errSMB2Protocol, req.command)
+		c.fatal = fmt.Errorf("%w: command 0x%02X before NEGOTIATE", errProtocolViolation, req.command)
 		return out, statusInvalidParameter
 	}
 

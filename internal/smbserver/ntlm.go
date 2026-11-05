@@ -3,13 +3,12 @@ package smbserver
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 )
 
-// This file implements just enough SPNEGO and NTLMSSP for SMB2 guest logons.
-// Credentials are never checked and no session key is derived.
+// This file implements just enough SPNEGO (RFC 4178) and NTLMSSP ([MS-NLMP]) for SMB2
+// guest logons. Credentials are never checked and no session key is derived.
 
 const (
 	ntlmMessageNegotiate    = 1
@@ -19,7 +18,7 @@ const (
 	ntlmChallengeHeaderSize = 56
 )
 
-// NTLMSSP negotiate flags.
+// NTLMSSP negotiate flags ([MS-NLMP] 2.2.2.5).
 const (
 	ntlmFlagUnicode       = 0x00000001
 	ntlmFlagRequestTarget = 0x00000004
@@ -40,7 +39,7 @@ const (
 		0x80000000 // 56
 )
 
-// AV pair identifiers of the CHALLENGE target info. MsvAvTimestamp is left out on
+// AV pair identifiers of the CHALLENGE target info ([MS-NLMP] 2.2.2.1). MsvAvTimestamp is left out on
 // purpose: it makes clients send a MIC, and they would then expect a signed
 // SPNEGO completion that a guest logon cannot produce.
 const (
@@ -69,8 +68,9 @@ type ntlmToken struct {
 	spnego      bool   // the token arrived wrapped, so the reply must be wrapped too
 }
 
-// parseNTLMToken locates the NTLMSSP message in blob, either raw or inside
-// SPNEGO. It searches for the signature instead of decoding the DER wrapper:
+// parseNTLMToken locates the NTLMSSP message in blob, either raw or inside SPNEGO,
+// and reads MessageType at 8 and, from NEGOTIATE_MESSAGE ([MS-NLMP] 2.2.1.1), the
+// flags at 12. It searches for the signature instead of decoding the DER wrapper:
 // nothing in the wrapper matters for a guest logon, and firmware clients are
 // known for loose encodings.
 func parseNTLMToken(blob []byte) (ntlmToken, error) {
@@ -83,16 +83,18 @@ func parseNTLMToken(blob []byte) (ntlmToken, error) {
 		return ntlmToken{}, fmt.Errorf("truncated NTLMSSP message: %d bytes", len(msg))
 	}
 	tok := ntlmToken{
-		messageType: binary.LittleEndian.Uint32(msg[8:12]),
+		messageType: le.Uint32(msg[8:12]),
 		spnego:      idx != 0,
 	}
 	if tok.messageType == ntlmMessageNegotiate && len(msg) >= 16 {
-		tok.flags = binary.LittleEndian.Uint32(msg[12:16])
+		tok.flags = le.Uint32(msg[12:16])
 	}
 	return tok, nil
 }
 
-// buildNTLMChallenge returns a CHALLENGE message answering clientFlags.
+// buildNTLMChallenge returns a CHALLENGE_MESSAGE ([MS-NLMP] 2.2.1.2) answering
+// clientFlags. The challenge is a nonce as specified, although no response is ever
+// checked.
 func buildNTLMChallenge(clientFlags uint32) ([]byte, error) {
 	target := encodeUTF16LE(ntlmTargetName)
 
@@ -107,9 +109,9 @@ func buildNTLMChallenge(clientFlags uint32) ([]byte, error) {
 
 	msg := make([]byte, ntlmChallengeHeaderSize, ntlmChallengeHeaderSize+len(target)+len(info))
 	copy(msg, ntlmSignature)
-	binary.LittleEndian.PutUint32(msg[8:], ntlmMessageChallenge)
+	le.PutUint32(msg[8:], ntlmMessageChallenge)
 	putNTLMField(msg[12:], len(target), ntlmChallengeHeaderSize)
-	binary.LittleEndian.PutUint32(msg[20:], flags)
+	le.PutUint32(msg[20:], flags)
 	if _, err := rand.Read(msg[24:32]); err != nil {
 		return nil, fmt.Errorf("generate NTLM challenge: %w", err)
 	}
@@ -123,17 +125,18 @@ func buildNTLMChallenge(clientFlags uint32) ([]byte, error) {
 	return msg, nil
 }
 
+// appendAvPair appends an AV_PAIR ([MS-NLMP] 2.2.2.1): AvId, AvLen and the value.
 func appendAvPair(b []byte, id uint16, value []byte) []byte {
-	b = binary.LittleEndian.AppendUint16(b, id)
-	b = binary.LittleEndian.AppendUint16(b, uint16(len(value)))
+	b = le.AppendUint16(b, id)
+	b = le.AppendUint16(b, uint16(len(value)))
 	return append(b, value...)
 }
 
 // putNTLMField writes an NTLMSSP payload descriptor (length, max length, offset).
 func putNTLMField(b []byte, length, offset int) {
-	binary.LittleEndian.PutUint16(b[0:], uint16(length))
-	binary.LittleEndian.PutUint16(b[2:], uint16(length))
-	binary.LittleEndian.PutUint32(b[4:], uint32(offset))
+	le.PutUint16(b[0:], uint16(length))
+	le.PutUint16(b[2:], uint16(length))
+	le.PutUint32(b[4:], uint32(offset))
 }
 
 // --- SPNEGO (DER) ---

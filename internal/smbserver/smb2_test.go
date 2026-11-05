@@ -2,344 +2,11 @@ package smbserver
 
 import (
 	"bytes"
-	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 )
-
-const testFileName = "Test.iso"
-
-// testContent returns deterministic data of a size that needs several 64 KiB reads.
-func testContent(size int) []byte {
-	b := make([]byte, size)
-	for i := range b {
-		b[i] = byte(i*7 + i>>8)
-	}
-	return b
-}
-
-func newTestServer(t testing.TB, content []byte) *Server {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), testFileName)
-	if err := os.WriteFile(path, content, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	share, err := OpenShare(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { share.Close() })
-	srv, err := NewServer(share, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return srv
-}
-
-// --- SMB2 test client ---
-
-// smb2Msg is a request to send or a parsed response.
-type smb2Msg struct {
-	command   uint16
-	status    uint32
-	flags     uint32
-	next      uint32
-	messageID uint64
-	treeID    uint32
-	sessionID uint64
-	credits   uint16
-	body      []byte
-	raw       []byte // whole message, for offsets relative to its start
-}
-
-func encodeRequest(m smb2Msg) []byte {
-	b := make([]byte, smb2HeaderSize, smb2HeaderSize+len(m.body))
-	copy(b, "\xFESMB")
-	le.PutUint16(b[4:], smb2HeaderSize)
-	le.PutUint16(b[6:], 1) // CreditCharge
-	le.PutUint16(b[12:], m.command)
-	le.PutUint16(b[14:], m.credits)
-	le.PutUint32(b[16:], m.flags)
-	le.PutUint32(b[20:], m.next)
-	le.PutUint64(b[24:], m.messageID)
-	le.PutUint32(b[36:], m.treeID)
-	le.PutUint64(b[40:], m.sessionID)
-	return append(b, m.body...)
-}
-
-func parseResponses(t testing.TB, frame []byte) []smb2Msg {
-	t.Helper()
-	var out []smb2Msg
-	for {
-		if len(frame) < smb2HeaderSize || string(frame[:4]) != "\xFESMB" {
-			t.Fatalf("bad SMB2 response: % x", frame[:min(len(frame), 16)])
-		}
-		m := smb2Msg{
-			status:    le.Uint32(frame[8:]),
-			command:   le.Uint16(frame[12:]),
-			credits:   le.Uint16(frame[14:]),
-			flags:     le.Uint32(frame[16:]),
-			next:      le.Uint32(frame[20:]),
-			messageID: le.Uint64(frame[24:]),
-			treeID:    le.Uint32(frame[36:]),
-			sessionID: le.Uint64(frame[40:]),
-		}
-		if m.flags&smb2FlagServerToRedir == 0 {
-			t.Errorf("response without SERVER_TO_REDIR: flags %#x", m.flags)
-		}
-		end := len(frame)
-		if m.next != 0 {
-			if m.next%8 != 0 {
-				t.Errorf("NextCommand %d not 8-byte aligned", m.next)
-			}
-			end = int(m.next)
-		}
-		m.raw = frame[:end]
-		m.body = frame[smb2HeaderSize:end]
-		out = append(out, m)
-		if m.next == 0 {
-			return out
-		}
-		frame = frame[end:]
-	}
-}
-
-type testClient struct {
-	t      testing.TB
-	conn   net.Conn
-	nextID uint64
-	sess   uint64
-	tree   uint32
-}
-
-// dialPipe connects a client to srv over net.Pipe and stops the handler at cleanup.
-func dialPipe(t testing.TB, srv *Server) *testClient {
-	t.Helper()
-	client, server := net.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.handleConn(ctx, server)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		client.Close()
-		<-done
-	})
-	if err := client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	return &testClient{t: t, conn: client}
-}
-
-func (c *testClient) sendFrame(payload []byte) {
-	c.t.Helper()
-	if err := writeFrame(c.conn, frameTypeSessionMessage, payload); err != nil {
-		c.t.Fatalf("write: %v", err)
-	}
-}
-
-func (c *testClient) recvFrame() []byte {
-	c.t.Helper()
-	frame, msgType, err := readFrame(c.conn)
-	if err != nil {
-		c.t.Fatalf("read: %v", err)
-	}
-	if msgType != frameTypeSessionMessage {
-		c.t.Fatalf("frame type %#x", msgType)
-	}
-	return frame
-}
-
-// call sends one request and returns its response.
-func (c *testClient) call(command uint16, body []byte) smb2Msg {
-	c.t.Helper()
-	id := c.nextID
-	c.nextID++
-	c.sendFrame(encodeRequest(smb2Msg{command: command, messageID: id, sessionID: c.sess, treeID: c.tree, body: body}))
-	rs := parseResponses(c.t, c.recvFrame())
-	if len(rs) != 1 {
-		c.t.Fatalf("got %d responses", len(rs))
-	}
-	if rs[0].messageID != id || rs[0].command != command {
-		c.t.Fatalf("response mid=%d cmd=%d for mid=%d cmd=%d", rs[0].messageID, rs[0].command, id, command)
-	}
-	return rs[0]
-}
-
-func negotiateBody(dialects ...uint16) []byte {
-	b := make([]byte, 36+2*len(dialects))
-	le.PutUint16(b[0:], 36)
-	le.PutUint16(b[2:], uint16(len(dialects)))
-	le.PutUint16(b[4:], 1) // SecurityMode
-	le.PutUint32(b[8:], 7) // Capabilities
-	copy(b[12:28], "client-guid-0123")
-	for i, d := range dialects {
-		le.PutUint16(b[36+2*i:], d)
-	}
-	return b
-}
-
-func sessionSetupBody(blob []byte) []byte {
-	b := make([]byte, 24, 24+len(blob))
-	le.PutUint16(b[0:], 25)
-	le.PutUint16(b[12:], smb2HeaderSize+24)
-	le.PutUint16(b[14:], uint16(len(blob)))
-	return append(b, blob...)
-}
-
-func ntlmMessage(msgType uint32) []byte {
-	b := append([]byte("NTLMSSP\x00"), make([]byte, 24)...)
-	le.PutUint32(b[8:], msgType)
-	le.PutUint32(b[12:], 0x80000010) // a few client flags
-	return b
-}
-
-func treeConnectBody(unc string) []byte {
-	path := encodeUTF16LE(unc)
-	b := make([]byte, 8, 8+len(path))
-	le.PutUint16(b[0:], 9)
-	le.PutUint16(b[4:], smb2HeaderSize+8)
-	le.PutUint16(b[6:], uint16(len(path)))
-	return append(b, path...)
-}
-
-func createBody(name string, access, disposition, options uint32) []byte {
-	path := encodeUTF16LE(name)
-	b := make([]byte, 56, 56+len(path))
-	le.PutUint16(b[0:], 57)
-	le.PutUint32(b[24:], access)
-	le.PutUint32(b[36:], disposition)
-	le.PutUint32(b[40:], options)
-	le.PutUint16(b[44:], smb2HeaderSize+56)
-	le.PutUint16(b[46:], uint16(len(path)))
-	return append(b, path...)
-}
-
-func closeBody(id []byte) []byte {
-	b := make([]byte, 24)
-	le.PutUint16(b[0:], 24)
-	le.PutUint16(b[2:], closeFlagPostQuery)
-	copy(b[8:], id)
-	return b
-}
-
-func readBody(id []byte, offset uint64, length, minimum uint32) []byte {
-	b := make([]byte, 49)
-	le.PutUint16(b[0:], 49)
-	le.PutUint32(b[4:], length)
-	le.PutUint64(b[8:], offset)
-	copy(b[16:], id)
-	le.PutUint32(b[32:], minimum)
-	return b
-}
-
-func queryInfoBody(id []byte, infoType, class byte, maxOutput uint32) []byte {
-	b := make([]byte, 40)
-	le.PutUint16(b[0:], 41)
-	b[2] = infoType
-	b[3] = class
-	le.PutUint32(b[4:], maxOutput)
-	copy(b[24:], id)
-	return b
-}
-
-func queryDirBody(id []byte, class, flags byte, pattern string, maxOutput uint32) []byte {
-	name := encodeUTF16LE(pattern)
-	b := make([]byte, 32, 32+len(name))
-	le.PutUint16(b[0:], 33)
-	b[2] = class
-	b[3] = flags
-	copy(b[8:], id)
-	le.PutUint16(b[24:], smb2HeaderSize+32)
-	le.PutUint16(b[26:], uint16(len(name)))
-	le.PutUint32(b[28:], maxOutput)
-	return append(b, name...)
-}
-
-// connect performs NEGOTIATE, the guest logon and TREE_CONNECT.
-func (c *testClient) connect(dialects ...uint16) {
-	c.t.Helper()
-	if r := c.call(smb2Negotiate, negotiateBody(dialects...)); r.status != statusOK {
-		c.t.Fatalf("NEGOTIATE status %#x", r.status)
-	}
-	r := c.call(smb2SessionSetup, sessionSetupBody(ntlmMessage(ntlmMessageNegotiate)))
-	if r.status != statusMoreProcessingRequired {
-		c.t.Fatalf("SESSION_SETUP 1 status %#x", r.status)
-	}
-	c.sess = r.sessionID
-	r = c.call(smb2SessionSetup, sessionSetupBody(ntlmMessage(ntlmMessageAuthenticate)))
-	if r.status != statusOK {
-		c.t.Fatalf("SESSION_SETUP 2 status %#x", r.status)
-	}
-	r = c.call(smb2TreeConnect, treeConnectBody(`\\host\share`))
-	if r.status != statusOK {
-		c.t.Fatalf("TREE_CONNECT status %#x", r.status)
-	}
-	c.tree = r.treeID
-}
-
-// open returns the FileId of a successful read-only open.
-func (c *testClient) open(name string) []byte {
-	c.t.Helper()
-	r := c.call(smb2Create, createBody(name, 0x00120089, fileOpen, 0))
-	if r.status != statusOK {
-		c.t.Fatalf("CREATE %q status %#x", name, r.status)
-	}
-	return r.body[64:80]
-}
-
-// --- Protocol detection ---
-
-func TestIdentifyProtocol(t *testing.T) {
-	tests := []struct {
-		name    string
-		frame   []byte
-		want    protocol
-		wantErr string
-	}{
-		{"smb1", []byte("\xFFSMB\x72"), protoSMB1, ""},
-		{"smb2", []byte("\xFESMB\x40"), protoSMB2, ""},
-		{"encrypted", []byte("\xFDSMB\x00"), 0, "fd 53 4d 42"},
-		{"garbage", []byte{1, 2, 3, 4, 5}, 0, "01 02 03 04"},
-		{"short", []byte{0xFE}, 0, "fe (1 byte frame)"},
-		{"empty", nil, 0, "(0 byte frame)"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := identifyProtocol(tt.frame)
-			if got != tt.want {
-				t.Errorf("protocol = %v, want %v", got, tt.want)
-			}
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				return
-			}
-			if !errors.Is(err, ErrUnknownProtocol) || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("error = %v, want ErrUnknownProtocol containing %q", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestUnknownProtocolDropsConnection(t *testing.T) {
-	c := dialPipe(t, newTestServer(t, nil))
-	c.sendFrame([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0})
-	if _, _, err := readFrame(c.conn); !errors.Is(err, io.EOF) {
-		t.Fatalf("read after unknown frame: %v, want EOF", err)
-	}
-}
 
 // --- NEGOTIATE ---
 
@@ -364,15 +31,6 @@ func TestChooseSMB2Dialect(t *testing.T) {
 			}
 		})
 	}
-}
-
-// bmcNegotiateFrame is the SMB2 message of the BMC's NEGOTIATE. It is rebuilt
-// from the fields decoded in the tcpdump capture (102 bytes, Command NEGOTIATE,
-// DialectCount 1, dialect 0x0302, SecurityMode 0x0001, Capabilities 0x00000007);
-// the capture's ClientGuid and MessageId values were not preserved.
-func bmcNegotiateFrame() []byte {
-	body := negotiateBody(0x0302)
-	return encodeRequest(smb2Msg{command: smb2Negotiate, credits: 1, body: body})
 }
 
 func TestBMCNegotiateSelects302(t *testing.T) {
@@ -444,64 +102,6 @@ func TestNegotiateFailures(t *testing.T) {
 	})
 }
 
-// smb1Negotiate builds an SMB1 NEGOTIATE frame offering dialects.
-func smb1Negotiate(dialects ...string) []byte {
-	var data []byte
-	for _, d := range dialects {
-		data = append(data, 0x02)
-		data = append(data, d...)
-		data = append(data, 0)
-	}
-	return buildSMB1Request(smbComNegotiate, nil, data)
-}
-
-func buildSMB1Request(command byte, words, data []byte) []byte {
-	return buildSMBResponse(&smbPacket{
-		header: smbHeader{command: command, flags2: smbFlags2Unicode | smbFlags2NTStatus, mid: 7},
-		words:  words,
-		data:   data,
-	})
-}
-
-func TestMultiProtocolNegotiate(t *testing.T) {
-	tests := []struct {
-		name     string
-		dialects []string
-		wantSMB2 uint16 // 0 means the response must be SMB1
-		wantIdx  uint16 // for SMB1
-	}{
-		{"nt lm only", []string{"NT LM 0.12"}, 0, 0},
-		{"nt lm wins over smb2", []string{"PC NETWORK PROGRAM 1.0", "NT LM 0.12", "SMB 2.002", "SMB 2.???"}, 0, 1},
-		{"wildcard", []string{"SMB 2.002", "SMB 2.???"}, smb2DialectWildcard, 0},
-		{"smb 2.002", []string{"SMB 2.002"}, smb2Dialect202, 0},
-		{"nothing known", []string{"LANMAN1.0"}, 0, 0xFFFF},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := dialPipe(t, newTestServer(t, nil))
-			c.sendFrame(smb1Negotiate(tt.dialects...))
-			frame := c.recvFrame()
-			if tt.wantSMB2 == 0 {
-				pkt, err := parseSMBPacket(frame)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if got := binary.LittleEndian.Uint16(pkt.words); got != tt.wantIdx {
-					t.Errorf("dialect index %d, want %d", got, tt.wantIdx)
-				}
-				return
-			}
-			r := parseResponses(t, frame)[0]
-			if r.messageID != 0 || r.command != smb2Negotiate || r.status != statusOK {
-				t.Fatalf("response %+v", r)
-			}
-			if d := le.Uint16(r.body[4:]); d != tt.wantSMB2 {
-				t.Errorf("dialect %#x, want %#x", d, tt.wantSMB2)
-			}
-		})
-	}
-}
-
 func TestWildcardRenegotiates(t *testing.T) {
 	c := dialPipe(t, newTestServer(t, testContent(10)))
 	c.sendFrame(smb1Negotiate("SMB 2.???"))
@@ -512,26 +112,6 @@ func TestWildcardRenegotiates(t *testing.T) {
 	if r := c.call(smb2Read, readBody(id, 0, 10, 0)); r.status != statusOK {
 		t.Errorf("READ status %#x", r.status)
 	}
-}
-
-func TestProtocolSwitchDropsConnection(t *testing.T) {
-	t.Run("smb1 after smb2", func(t *testing.T) {
-		c := dialPipe(t, newTestServer(t, nil))
-		c.call(smb2Negotiate, negotiateBody(0x0210))
-		c.sendFrame(smb1Negotiate("NT LM 0.12"))
-		if _, _, err := readFrame(c.conn); !errors.Is(err, io.EOF) {
-			t.Errorf("read: %v, want EOF", err)
-		}
-	})
-	t.Run("smb2 after smb1", func(t *testing.T) {
-		c := dialPipe(t, newTestServer(t, nil))
-		c.sendFrame(smb1Negotiate("NT LM 0.12"))
-		c.recvFrame()
-		c.sendFrame(encodeRequest(smb2Msg{command: smb2Negotiate, body: negotiateBody(0x0210)}))
-		if _, _, err := readFrame(c.conn); !errors.Is(err, io.EOF) {
-			t.Errorf("read: %v, want EOF", err)
-		}
-	})
 }
 
 // --- NTLM ---
@@ -653,7 +233,7 @@ func TestSessionSetupFailures(t *testing.T) {
 		name    string
 		session uint64
 		blob    []byte
-		want    uint32
+		want    ntStatus
 	}{
 		{"authenticate without negotiate", 0, ntlmMessage(ntlmMessageAuthenticate), statusLogonFailure},
 		{"unknown session", 99, ntlmMessage(ntlmMessageNegotiate), statusUserSessionDeleted},
@@ -705,15 +285,6 @@ func TestRequiresSessionAndTree(t *testing.T) {
 	}
 }
 
-func (c *testClient) connect2Session() {
-	c.t.Helper()
-	r := c.call(smb2SessionSetup, sessionSetupBody(ntlmMessage(ntlmMessageNegotiate)))
-	c.sess = r.sessionID
-	if r := c.call(smb2SessionSetup, sessionSetupBody(ntlmMessage(ntlmMessageAuthenticate))); r.status != statusOK {
-		c.t.Fatalf("status %#x", r.status)
-	}
-}
-
 func TestTreeDisconnectAndLogoffCloseHandles(t *testing.T) {
 	t.Run("tree disconnect", func(t *testing.T) {
 		c := dialPipe(t, newTestServer(t, testContent(10)))
@@ -753,7 +324,7 @@ func TestCreate(t *testing.T) {
 		access      uint32
 		disposition uint32
 		options     uint32
-		want        uint32
+		want        ntStatus
 	}{
 		{"file", testFileName, readAttrs, fileOpen, 0, statusOK},
 		{"case insensitive", "TEST.ISO", readAttrs, fileOpen, 0, statusOK},
@@ -838,7 +409,7 @@ func TestReadBoundaries(t *testing.T) {
 		offset   uint64
 		length   uint32
 		minimum  uint32
-		want     uint32
+		want     ntStatus
 		wantData int
 	}{
 		{"start", 0, 100, 0, statusOK, 100},
@@ -908,20 +479,6 @@ func TestClose(t *testing.T) {
 }
 
 // --- Compound requests ---
-
-func alignCompound(msgs ...[]byte) []byte {
-	var out []byte
-	for i, m := range msgs {
-		if i < len(msgs)-1 {
-			for len(m)%8 != 0 {
-				m = append(m, 0)
-			}
-			le.PutUint32(m[20:], uint32(len(m)))
-		}
-		out = append(out, m...)
-	}
-	return out
-}
 
 func TestCompoundCreateQueryClose(t *testing.T) {
 	c := dialPipe(t, newTestServer(t, testContent(1234)))
@@ -1127,7 +684,7 @@ func TestQueryInfoErrors(t *testing.T) {
 	tests := []struct {
 		name string
 		body []byte
-		want uint32
+		want ntStatus
 	}{
 		{"unknown class", queryInfoBody(id, infoTypeFile, 99, 4096), statusInvalidInfoClass},
 		{"unknown fs class", queryInfoBody(id, infoTypeFilesystem, 99, 4096), statusInvalidInfoClass},
@@ -1233,7 +790,7 @@ func TestQueryDirectoryErrors(t *testing.T) {
 	tests := []struct {
 		name string
 		body []byte
-		want uint32
+		want ntStatus
 	}{
 		{"pattern mismatch", queryDirBody(root, fileDirectoryInformation, 0, "*.img", 4096), statusNoSuchFile},
 		{"unknown class", queryDirBody(root, 99, 0, "*", 4096), statusInvalidInfoClass},
@@ -1251,30 +808,6 @@ func TestQueryDirectoryErrors(t *testing.T) {
 }
 
 // --- IOCTL ---
-
-func ioctlBody(code uint32, input []byte, maxOutput uint32) []byte {
-	b := make([]byte, 56, 56+len(input))
-	le.PutUint16(b[0:], 57)
-	le.PutUint32(b[4:], code)
-	copy(b[8:24], bytes.Repeat([]byte{0xFF}, 16))
-	le.PutUint32(b[24:], smb2HeaderSize+56)
-	le.PutUint32(b[28:], uint32(len(input)))
-	le.PutUint32(b[44:], maxOutput)
-	le.PutUint32(b[48:], 1) // SMB2_0_IOCTL_IS_FSCTL
-	return append(b, input...)
-}
-
-func validateNegotiateInput(caps uint32, securityMode uint16, dialects ...uint16) []byte {
-	b := make([]byte, 24+2*len(dialects))
-	le.PutUint32(b[0:], caps)
-	copy(b[4:20], "client-guid-0123")
-	le.PutUint16(b[20:], securityMode)
-	le.PutUint16(b[22:], uint16(len(dialects)))
-	for i, d := range dialects {
-		le.PutUint16(b[24+2*i:], d)
-	}
-	return b
-}
 
 func TestValidateNegotiate(t *testing.T) {
 	srv := newTestServer(t, nil)
@@ -1341,7 +874,7 @@ func TestRejectedCommandsKeepConnection(t *testing.T) {
 	c.connect(0x0302)
 	for _, tt := range []struct {
 		command uint16
-		want    uint32
+		want    ntStatus
 	}{
 		{smb2Write, statusAccessDenied},
 		{smb2SetInfo, statusAccessDenied},
@@ -1432,241 +965,6 @@ func TestE2ESMB2(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestE2ESMB1 is the regression test for the unchanged SMB1 path: the sequence a
-// BMC runs, checked at byte level.
-func TestE2ESMB1(t *testing.T) {
-	content := testContent(100000)
-	c := dialPipe(t, newTestServer(t, content))
-
-	roundTrip := func(command byte, words, data []byte) *smbPacket {
-		t.Helper()
-		c.sendFrame(buildSMB1Request(command, words, data))
-		pkt, err := parseSMBPacket(c.recvFrame())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pkt.header.command != command || pkt.header.mid != 7 || pkt.header.flags&smbFlagReply == 0 {
-			t.Fatalf("bad reply header: %+v", pkt.header)
-		}
-		if pkt.header.status != statusOK {
-			t.Fatalf("command %#x: status %#x", command, pkt.header.status)
-		}
-		return pkt
-	}
-
-	c.sendFrame(smb1Negotiate("NT LM 0.12"))
-	neg, err := parseSMBPacket(c.recvFrame())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(neg.words) != 34 || binary.LittleEndian.Uint16(neg.words) != 0 {
-		t.Fatalf("negotiate words: % x", neg.words)
-	}
-
-	setup := roundTrip(smbComSessionSetupAndX, make([]byte, 26), nil)
-	if action := binary.LittleEndian.Uint16(setup.words[4:]); action != 1 {
-		t.Errorf("action %d, want guest", action)
-	}
-	tree := roundTrip(smbComTreeConnectAndX, make([]byte, 8), nil)
-	if !bytes.HasPrefix(tree.data, []byte("A:\x00")) {
-		t.Errorf("tree data %q", tree.data)
-	}
-
-	name := append([]byte{0}, encodeUTF16LE(`\`+testFileName)...)
-	createWords := make([]byte, 48)
-	binary.LittleEndian.PutUint16(createWords[5:], uint16(len(name)-1))
-	create := roundTrip(smbComNtCreateAndX, createWords, name)
-	if size := binary.LittleEndian.Uint64(create.words[55:]); size != uint64(len(content)) {
-		t.Errorf("size %d", size)
-	}
-	fid := binary.LittleEndian.Uint16(create.words[5:])
-
-	var got []byte
-	for len(got) < len(content) {
-		words := make([]byte, 24)
-		words[0] = 0xFF
-		binary.LittleEndian.PutUint16(words[4:], fid)
-		binary.LittleEndian.PutUint32(words[6:], uint32(len(got)))
-		binary.LittleEndian.PutUint16(words[10:], 60000)
-		read := roundTrip(smbComReadAndX, words, nil)
-		n := int(binary.LittleEndian.Uint16(read.words[10:]))
-		off := int(binary.LittleEndian.Uint16(read.words[12:]))
-		if off != 60 || n == 0 {
-			t.Fatalf("read offset %d length %d", off, n)
-		}
-		got = append(got, read.data[1:1+n]...)
-	}
-	if !bytes.Equal(got, content) {
-		t.Error("downloaded content differs")
-	}
-
-	roundTrip(smbComClose, make([]byte, 6), nil)
-	roundTrip(smbComTreeDisconnect, nil, nil)
-	roundTrip(smbComLogoffAndX, make([]byte, 4), nil)
-}
-
-func TestSessionRequestFrame(t *testing.T) {
-	c := dialPipe(t, newTestServer(t, nil))
-	if err := writeFrame(c.conn, frameTypeSessionRequest, []byte("names")); err != nil {
-		t.Fatal(err)
-	}
-	if _, msgType, err := readFrame(c.conn); err != nil || msgType != frameTypePositiveSession {
-		t.Errorf("type %#x, err %v", msgType, err)
-	}
-}
-
-// --- Lifecycle ---
-
-func TestServeShutdown(t *testing.T) {
-	srv := newTestServer(t, testContent(10))
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ctx, ln) }()
-
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeFrame(conn, frameTypeSessionMessage, encodeRequest(smb2Msg{command: smb2Negotiate, body: negotiateBody(0x0302)})); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := readFrame(conn); err != nil {
-		t.Fatal(err)
-	}
-
-	cancel()
-	select {
-	case err := <-serveErr:
-		if err != nil {
-			t.Errorf("Serve returned %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Serve did not return after cancel")
-	}
-	if _, _, err := readFrame(conn); err == nil {
-		t.Error("connection still open after shutdown")
-	}
-}
-
-func TestServeListenerClosedExternally(t *testing.T) {
-	srv := newTestServer(t, nil)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(context.Background(), ln) }()
-	ln.Close()
-	select {
-	case err := <-serveErr:
-		if !errors.Is(err, net.ErrClosed) {
-			t.Errorf("Serve returned %v, want net.ErrClosed", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Serve kept running on a closed listener")
-	}
-}
-
-func TestOpenShareRejectsDirectory(t *testing.T) {
-	if _, err := OpenShare(t.TempDir()); err == nil {
-		t.Error("expected an error for a directory")
-	}
-	if _, err := OpenShare(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("missing file: %v", err)
-	}
-}
-
-// --- Fuzzing ---
-
-func FuzzParseSMB1Packet(f *testing.F) {
-	f.Add(smb1Negotiate("NT LM 0.12"))
-	f.Add(buildSMB1Request(smbComReadAndX, make([]byte, 24), nil))
-	f.Add([]byte{0xFF, 'S', 'M', 'B'})
-	f.Fuzz(func(t *testing.T, data []byte) {
-		if pkt, err := parseSMBPacket(data); err == nil {
-			buildSMBResponse(pkt)
-		}
-		smb1Dialects(data)
-	})
-}
-
-// FuzzSMB1Dispatch feeds arbitrary requests to all SMB1 handlers.
-func FuzzSMB1Dispatch(f *testing.F) {
-	for _, command := range []byte{smbComNegotiate, smbComSessionSetupAndX, smbComTreeConnectAndX,
-		smbComNtCreateAndX, smbComReadAndX, smbComClose, smbComTransaction2, smbComEcho} {
-		f.Add(buildSMB1Request(command, make([]byte, 60), make([]byte, 40)))
-	}
-	srv := newTestServer(f, testContent(1000))
-	f.Fuzz(func(t *testing.T, data []byte) {
-		pkt, err := parseSMBPacket(data)
-		if err != nil {
-			return
-		}
-		if err := newSMB1Session(srv).serve(io.Discard, pkt); err != nil {
-			t.Fatal(err)
-		}
-	})
-}
-
-func FuzzParseSMB2Message(f *testing.F) {
-	f.Add(bmcNegotiateFrame())
-	f.Add(alignCompound(encodeRequest(smb2Msg{command: smb2Echo}), encodeRequest(smb2Msg{command: smb2Echo})))
-	f.Fuzz(func(t *testing.T, data []byte) {
-		for rest := data; len(rest) > 0; {
-			req, next, err := parseSMB2Message(rest)
-			if err != nil {
-				return
-			}
-			if len(next) >= len(rest) {
-				t.Fatalf("no progress: %d -> %d bytes", len(rest), len(next))
-			}
-			rest = next
-			req.payload(smb2HeaderSize, 1)
-			req.payload(^uint32(0), ^uint32(0))
-		}
-	})
-}
-
-// FuzzSMB2ServeFrame feeds arbitrary frames to an authenticated connection, so
-// the fuzzer reaches every command handler.
-func FuzzSMB2ServeFrame(f *testing.F) {
-	id := make([]byte, 16)
-	le.PutUint64(id, 1)
-	le.PutUint64(id[8:], 1)
-	msg := func(command uint16, body []byte) []byte {
-		return encodeRequest(smb2Msg{command: command, sessionID: 1, treeID: 1, body: body})
-	}
-	f.Add(msg(smb2Create, createBody(testFileName, 0x80, fileOpen, 0)))
-	f.Add(msg(smb2Read, readBody(id, 0, 100, 0)))
-	f.Add(msg(smb2Close, closeBody(id)))
-	f.Add(msg(smb2QueryInfo, queryInfoBody(id, infoTypeFile, fileAllInformation, 4096)))
-	f.Add(msg(smb2QueryInfo, queryInfoBody(id, infoTypeFilesystem, fileFsVolumeInformation, 4096)))
-	f.Add(msg(smb2QueryDirectory, queryDirBody(id, fileIDBothDirInformation, 0, "*", 4096)))
-	f.Add(msg(smb2Ioctl, ioctlBody(fsctlValidateNegotiateInfo, validateNegotiateInput(7, 1, 0x0302), 24)))
-	f.Add(msg(smb2SessionSetup, sessionSetupBody(ntlmMessage(ntlmMessageNegotiate))))
-	f.Add(msg(smb2TreeConnect, treeConnectBody(`\\h\s`)))
-	f.Add(alignCompound(msg(smb2Create, createBody(testFileName, 0x80, fileOpen, 0)), msg(smb2Close, closeBody(id))))
-
-	srv := newTestServer(f, testContent(1000))
-	f.Fuzz(func(t *testing.T, frame []byte) {
-		c := newSMB2Conn(srv, "fuzz")
-		c.dialect = smb2Dialect302
-		c.sessions[1] = &smb2Session{authenticated: true, trees: map[uint32]*smb2Tree{1: {}}}
-		c.handles[1] = &smb2Handle{id: smb2FileID{1, 1}, sessionID: 1, treeID: 1}
-		c.lastSession, c.lastTree, c.lastHandle = 1, 1, 1
-		_ = c.serveFrame(io.Discard, frame)
-	})
 }
 
 // BenchmarkSMB2Read measures the allocation-free read path.

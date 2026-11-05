@@ -1,18 +1,12 @@
 package smbserver
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
-	"time"
-	"unicode/utf16"
 )
 
 const (
-	// maxBufferSize is the largest payload of a single read, in both SMB1 and SMB2.
-	maxBufferSize = 65536
-
 	frameHeaderSize = 4
 	maxFrameSize    = 0x100000
 
@@ -22,7 +16,7 @@ const (
 	pooledBufferSize = frameHeaderSize + 64 + 16 + maxBufferSize
 )
 
-// NetBIOS session service message types.
+// NetBIOS session service message types (RFC 1002, 4.3.1).
 const (
 	frameTypeSessionMessage  = 0x00
 	frameTypeSessionRequest  = 0x81
@@ -37,7 +31,9 @@ var readBufPool = sync.Pool{
 	},
 }
 
-// readFrame reads one NetBIOS session service frame (4-byte header: type + 24-bit length).
+// readFrame reads one frame. The 4-byte header is the same for the NetBIOS session
+// service on port 139 and for Direct TCP on port 445 ([MS-SMB2] 2.1): a type byte,
+// zero on Direct TCP, and a 24-bit big-endian length.
 func readFrame(r io.Reader) (data []byte, msgType byte, err error) {
 	var hdr [frameHeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -67,40 +63,10 @@ func writeFrame(w io.Writer, msgType byte, data []byte) error {
 	return err
 }
 
+// putFrameHeader writes the 4-byte frame header to buf.
 func putFrameHeader(buf []byte, msgType byte, length int) {
 	buf[0] = msgType
 	buf[1] = byte(length >> 16)
 	buf[2] = byte(length >> 8)
 	buf[3] = byte(length)
-}
-
-// --- Wire encoding helpers ---
-
-func timeToFiletime(t time.Time) uint64 {
-	// Windows FILETIME: 100ns intervals since 1601-01-01.
-	const epochDiff = 116444736000000000
-	return uint64(t.UnixNano()/100) + epochDiff
-}
-
-func encodeUTF16LE(s string) []byte {
-	codes := utf16.Encode([]rune(s))
-	b := make([]byte, len(codes)*2)
-	for i, c := range codes {
-		binary.LittleEndian.PutUint16(b[i*2:], c)
-	}
-	return b
-}
-
-func decodeUTF16LE(b []byte) string {
-	if len(b) < 2 {
-		return ""
-	}
-	u16 := make([]uint16, len(b)/2)
-	for i := range u16 {
-		u16[i] = binary.LittleEndian.Uint16(b[i*2:])
-	}
-	for len(u16) > 0 && u16[len(u16)-1] == 0 {
-		u16 = u16[:len(u16)-1]
-	}
-	return string(utf16.Decode(u16))
 }

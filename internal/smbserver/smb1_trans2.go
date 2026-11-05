@@ -1,30 +1,43 @@
 package smbserver
 
 import (
-	"encoding/binary"
 	"log"
 	"strings"
 	"time"
 )
 
+// Filesystem values only SMB1 reports ([MS-FSCC] 2.5.10 and 2.5.1). SMB2 uses other
+// ones, see smb2_file.go. Real firmware has been tested against these, so they stay
+// although neither describes the share well: FILE_DEVICE_IS_MOUNTED does not say
+// read-only, and names are in fact compared without regard to case.
+const (
+	fileDeviceIsMounted   = 0x00000020
+	fsCaseSensitiveSearch = 0x00000001
+)
+
 // --- TRANSACTION2 (0x32) ---
 
-func handleTrans2(sess *session, req *smbPacket) *smbPacket {
+// handleTrans2 unpacks SMB_COM_TRANSACTION2 ([MS-CIFS] 2.2.4.46) and runs its
+// subcommand. It reads ParameterCount at 18, ParameterOffset at 20, SetupCount at 26
+// and the subcommand in Setup at 28. Follow-up messages of a split request are not
+// implemented: the parameters of the supported subcommands fit into one. If
+// ParameterCount exceeds the data, the rest of the data serves as parameters.
+func (sess *smb1Session) handleTrans2(req *smbPacket) (*smbPacket, ntStatus) {
 	if len(req.words) < 28 {
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 
 	setupCount := int(req.words[26])
 	if setupCount < 1 || len(req.words) < 28+setupCount*2 {
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
-	subcommand := binary.LittleEndian.Uint16(req.words[28:30])
+	subcommand := le.Uint16(req.words[28:])
 
-	paramCount := int(binary.LittleEndian.Uint16(req.words[18:20]))
-	paramOffset := int(binary.LittleEndian.Uint16(req.words[20:22]))
+	paramCount := int(le.Uint16(req.words[18:]))
+	paramOffset := int(le.Uint16(req.words[20:]))
 
 	// Convert paramOffset (from SMB header start) to data section offset.
-	headerLen := 32 + 1 + len(req.words) + 2
+	headerLen := smb1HeaderSize + 1 + len(req.words) + 2
 	transParamStart := paramOffset - headerLen
 	var transParams []byte
 	if transParamStart >= 0 && transParamStart+paramCount <= len(req.data) {
@@ -35,24 +48,27 @@ func handleTrans2(sess *session, req *smbPacket) *smbPacket {
 
 	switch subcommand {
 	case trans2FindFirst2:
-		return handleFindFirst2(sess, req, transParams)
+		return sess.handleFindFirst2(req, transParams)
 	case trans2QueryFSInfo:
-		return handleQueryFSInfo(sess, req, transParams)
+		return sess.handleQueryFSInfo(req, transParams)
 	case trans2QueryPathInfo:
-		return handleQueryPathInfo(sess, req, transParams)
+		return sess.handleQueryPathInfo(req, transParams)
 	case trans2QueryFileInfo:
-		return handleQueryFileInfo(sess, req, transParams)
+		return sess.handleQueryFileInfo(req, transParams)
 	default:
 		log.Printf("Unhandled TRANS2 subcommand: 0x%04X", subcommand)
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 }
 
-func handleQueryFSInfo(sess *session, req *smbPacket, transParams []byte) *smbPacket {
+// handleQueryFSInfo answers TRANS2_QUERY_FS_INFORMATION ([MS-CIFS] 2.2.6.4). The
+// parameters hold InformationLevel at 0. The total size rounds down, unlike in SMB2,
+// so a file below one allocation unit reports zero units.
+func (sess *smb1Session) handleQueryFSInfo(req *smbPacket, transParams []byte) (*smbPacket, ntStatus) {
 	if len(transParams) < 2 {
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
-	infoLevel := binary.LittleEndian.Uint16(transParams[0:2])
+	infoLevel := le.Uint16(transParams)
 	log.Printf("QUERY_FS_INFO level=0x%04X", infoLevel)
 
 	var infoData []byte
@@ -61,79 +77,76 @@ func handleQueryFSInfo(sess *session, req *smbPacket, transParams []byte) *smbPa
 	case smbQueryFSSizeInfo:
 		// TotalUnits(8) + FreeUnits(8) + SectorsPerUnit(4) + BytesPerSector(4)
 		infoData = make([]byte, 24)
-		totalUnits := uint64(sess.fileSize) / 4096
-		binary.LittleEndian.PutUint64(infoData[0:8], totalUnits)
+		le.PutUint64(infoData[0:], uint64(sess.srv.share.Size())/allocationUnit)
 		// FreeUnits = 0 (read-only)
-		binary.LittleEndian.PutUint32(infoData[16:20], 8)   // sectors per unit
-		binary.LittleEndian.PutUint32(infoData[20:24], 512) // bytes per sector
+		le.PutUint32(infoData[16:], sectorsPerUnit)
+		le.PutUint32(infoData[20:], bytesPerSector)
 
 	case smbQueryFSDeviceInfo:
 		// DeviceType(4) + Characteristics(4)
 		infoData = make([]byte, 8)
-		binary.LittleEndian.PutUint32(infoData[0:4], 0x00000007) // FILE_DEVICE_DISK
-		binary.LittleEndian.PutUint32(infoData[4:8], 0x00000020) // READ_ONLY_DEVICE
+		le.PutUint32(infoData[0:], fileDeviceDisk)
+		le.PutUint32(infoData[4:], fileDeviceIsMounted)
 
 	case smbQueryFSAttributeInfo:
 		// Attributes(4) + MaxNameLen(4) + FSNameLen(4) + FSName
-		fsName := encodeUTF16LE("FAT")
+		fsName := encodeUTF16LE(fsAttributeName)
 		infoData = make([]byte, 12+len(fsName))
-		binary.LittleEndian.PutUint32(infoData[0:4], 0x0001) // CASE_SENSITIVE_SEARCH
-		binary.LittleEndian.PutUint32(infoData[4:8], 255)
-		binary.LittleEndian.PutUint32(infoData[8:12], uint32(len(fsName)))
+		le.PutUint32(infoData[0:], fsCaseSensitiveSearch)
+		le.PutUint32(infoData[4:], maxFileNameLength)
+		le.PutUint32(infoData[8:], uint32(len(fsName)))
 		copy(infoData[12:], fsName)
 
 	default:
 		log.Printf("Unhandled FS info level: 0x%04X", infoLevel)
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 
-	return buildTrans2Response(req, nil, infoData)
+	return buildTrans2Response(req, nil, infoData), statusOK
 }
 
-func handleQueryPathInfo(sess *session, req *smbPacket, transParams []byte) *smbPacket {
+// handleQueryPathInfo answers TRANS2_QUERY_PATH_INFORMATION ([MS-CIFS] 2.2.6.6). The
+// parameters hold InformationLevel at 0 and FileName at 6. An empty path is the root.
+func (sess *smb1Session) handleQueryPathInfo(req *smbPacket, transParams []byte) (*smbPacket, ntStatus) {
 	if len(transParams) < 6 {
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 
-	infoLevel := binary.LittleEndian.Uint16(transParams[0:2])
-	pathBytes := transParams[6:]
-
-	var path string
-	if sess.unicode {
-		path = decodeUTF16LE(pathBytes)
-	} else {
-		path = strings.TrimRight(string(pathBytes), "\x00")
-	}
-	path = strings.TrimPrefix(path, "\\")
-
+	infoLevel := le.Uint16(transParams)
+	path := strings.TrimPrefix(sess.decodeString(transParams[6:]), "\\")
 	log.Printf("QUERY_PATH_INFO level=0x%04X path=%q", infoLevel, path)
 
+	share := sess.srv.share
 	if path == "" {
 		return buildFileInfoResponse(req, infoLevel, true, 0)
 	}
-	if strings.EqualFold(path, sess.fileName) {
-		return buildFileInfoResponse(req, infoLevel, false, sess.fileSize)
+	if strings.EqualFold(path, share.Name()) {
+		return buildFileInfoResponse(req, infoLevel, false, share.Size())
 	}
-	return errorResponse(req, statusObjectNameNotFound)
+	return nil, statusObjectNameNotFound
 }
 
-func handleQueryFileInfo(sess *session, req *smbPacket, transParams []byte) *smbPacket {
+// handleQueryFileInfo answers TRANS2_QUERY_FILE_INFORMATION ([MS-CIFS] 2.2.6.8). The
+// parameters hold FID at 0 and InformationLevel at 2. Every FID other than the file's
+// counts as the root directory.
+func (sess *smb1Session) handleQueryFileInfo(req *smbPacket, transParams []byte) (*smbPacket, ntStatus) {
 	if len(transParams) < 4 {
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 
-	fid := binary.LittleEndian.Uint16(transParams[0:2])
-	infoLevel := binary.LittleEndian.Uint16(transParams[2:4])
-
+	fid := le.Uint16(transParams)
+	infoLevel := le.Uint16(transParams[2:])
 	log.Printf("QUERY_FILE_INFO fid=0x%04X level=0x%04X", fid, infoLevel)
 
-	if fid == sess.fid {
-		return buildFileInfoResponse(req, infoLevel, false, sess.fileSize)
+	if fid == smb1FileFID {
+		return buildFileInfoResponse(req, infoLevel, false, sess.srv.share.Size())
 	}
 	return buildFileInfoResponse(req, infoLevel, true, 0)
 }
 
-func buildFileInfoResponse(req *smbPacket, infoLevel uint16, isDir bool, size int64) *smbPacket {
+// buildFileInfoResponse answers a query for the file or the root directory. The
+// timestamps are the current time.
+func buildFileInfoResponse(req *smbPacket, infoLevel uint16, isDir bool, size int64) (*smbPacket, ntStatus) {
 	now := timeToFiletime(time.Now())
 	attr := uint32(fileAttrReadOnly)
 	if isDir {
@@ -145,128 +158,96 @@ func buildFileInfoResponse(req *smbPacket, infoLevel uint16, isDir bool, size in
 	switch infoLevel {
 	case smbQueryFileBasicInfo:
 		infoData = make([]byte, 40)
-		binary.LittleEndian.PutUint64(infoData[0:8], now)
-		binary.LittleEndian.PutUint64(infoData[8:16], now)
-		binary.LittleEndian.PutUint64(infoData[16:24], now)
-		binary.LittleEndian.PutUint64(infoData[24:32], now)
-		binary.LittleEndian.PutUint32(infoData[32:36], attr)
+		putTimes(infoData, now)
+		le.PutUint32(infoData[32:], attr)
 
 	case smbQueryFileStandardInfo:
 		infoData = make([]byte, 22)
-		binary.LittleEndian.PutUint64(infoData[0:8], uint64(size))
-		binary.LittleEndian.PutUint64(infoData[8:16], uint64(size))
-		binary.LittleEndian.PutUint32(infoData[16:20], 1)
+		le.PutUint64(infoData[0:], uint64(size))
+		le.PutUint64(infoData[8:], uint64(size))
+		le.PutUint32(infoData[16:], 1) // NumberOfLinks
 		if isDir {
 			infoData[21] = 1
 		}
 
 	case smbQueryFileAllInfo:
 		infoData = make([]byte, 72)
-		binary.LittleEndian.PutUint64(infoData[0:8], now)
-		binary.LittleEndian.PutUint64(infoData[8:16], now)
-		binary.LittleEndian.PutUint64(infoData[16:24], now)
-		binary.LittleEndian.PutUint64(infoData[24:32], now)
-		binary.LittleEndian.PutUint32(infoData[32:36], attr)
+		putTimes(infoData, now)
+		le.PutUint32(infoData[32:], attr)
 		// Pad at 36:40
-		binary.LittleEndian.PutUint64(infoData[40:48], uint64(size))
-		binary.LittleEndian.PutUint64(infoData[48:56], uint64(size))
-		binary.LittleEndian.PutUint32(infoData[56:60], 1) // NumberOfLinks
+		le.PutUint64(infoData[40:], uint64(size))
+		le.PutUint64(infoData[48:], uint64(size))
+		le.PutUint32(infoData[56:], 1) // NumberOfLinks
 		if isDir {
 			infoData[61] = 1
 		}
 		// EaSize(4) at 64, FileNameLength(4) at 68 = 0
 
 	default:
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 
-	return buildTrans2Response(req, nil, infoData)
+	return buildTrans2Response(req, nil, infoData), statusOK
 }
 
-func handleFindFirst2(sess *session, req *smbPacket, transParams []byte) *smbPacket {
+// handleFindFirst2 answers TRANS2_FIND_FIRST2 ([MS-CIFS] 2.2.6.2). The parameters
+// hold InformationLevel at 6 and FileName, the search pattern, at 12. The pattern is
+// only logged: the response always lists the file. No search state remains, because
+// EndOfSearch is always set and no FIND_NEXT2 can follow.
+func (sess *smb1Session) handleFindFirst2(req *smbPacket, transParams []byte) (*smbPacket, ntStatus) {
 	if len(transParams) < 12 {
-		return errorResponse(req, statusNotImplemented)
+		return nil, statusNotImplemented
 	}
 
-	infoLevel := binary.LittleEndian.Uint16(transParams[6:8])
-	patternBytes := transParams[12:]
-
-	var pattern string
-	if sess.unicode {
-		pattern = decodeUTF16LE(patternBytes)
-	} else {
-		pattern = strings.TrimRight(string(patternBytes), "\x00")
-	}
+	infoLevel := le.Uint16(transParams[6:])
+	pattern := sess.decodeString(transParams[12:])
 	log.Printf("FIND_FIRST2 level=0x%04X pattern=%q", infoLevel, pattern)
 
-	now := timeToFiletime(time.Now())
-	var nameBytes []byte
-	if sess.unicode {
-		nameBytes = encodeUTF16LE(sess.fileName)
-	} else {
-		nameBytes = []byte(sess.fileName)
+	share := sess.srv.share
+	nameBytes := sess.encodeString(share.Name())
+
+	// Both layouts share everything up to FileNameLength. FILE_BOTH_DIR_INFO then
+	// adds EaSize, ShortNameLength, a reserved byte and ShortName, all zero. Other
+	// levels fall back to FILE_DIRECTORY_INFO.
+	nameOffset := 64
+	if infoLevel == smbFindFileBothDirInfo {
+		nameOffset = 94
 	}
-
-	var entryData []byte
-
-	switch infoLevel {
-	case smbFindFileBothDirInfo:
-		entryData = make([]byte, 94+len(nameBytes))
-		// NextEntryOffset(4)=0, FileIndex(4)=0
-		binary.LittleEndian.PutUint64(entryData[8:16], now)
-		binary.LittleEndian.PutUint64(entryData[16:24], now)
-		binary.LittleEndian.PutUint64(entryData[24:32], now)
-		binary.LittleEndian.PutUint64(entryData[32:40], now)
-		binary.LittleEndian.PutUint64(entryData[40:48], uint64(sess.fileSize))
-		binary.LittleEndian.PutUint64(entryData[48:56], uint64(sess.fileSize))
-		binary.LittleEndian.PutUint32(entryData[56:60], fileAttrReadOnly)
-		binary.LittleEndian.PutUint32(entryData[60:64], uint32(len(nameBytes)))
-		// EaSize(4)=0, ShortNameLength(1)=0, Reserved(1)=0, ShortName(24)=zeros
-		copy(entryData[94:], nameBytes)
-
-	default:
-		// FILE_DIRECTORY_INFO fallback.
-		entryData = make([]byte, 64+len(nameBytes))
-		binary.LittleEndian.PutUint64(entryData[8:16], now)
-		binary.LittleEndian.PutUint64(entryData[16:24], now)
-		binary.LittleEndian.PutUint64(entryData[24:32], now)
-		binary.LittleEndian.PutUint64(entryData[32:40], now)
-		binary.LittleEndian.PutUint64(entryData[40:48], uint64(sess.fileSize))
-		binary.LittleEndian.PutUint64(entryData[48:56], uint64(sess.fileSize))
-		binary.LittleEndian.PutUint32(entryData[56:60], fileAttrReadOnly)
-		binary.LittleEndian.PutUint32(entryData[60:64], uint32(len(nameBytes)))
-		copy(entryData[64:], nameBytes)
-	}
+	entryData := make([]byte, nameOffset+len(nameBytes))
+	// NextEntryOffset(4)=0, FileIndex(4)=0
+	putTimes(entryData[8:], timeToFiletime(time.Now()))
+	le.PutUint64(entryData[40:], uint64(share.Size()))
+	le.PutUint64(entryData[48:], uint64(share.Size()))
+	le.PutUint32(entryData[56:], fileAttrReadOnly)
+	le.PutUint32(entryData[60:], uint32(len(nameBytes)))
+	copy(entryData[nameOffset:], nameBytes)
 
 	// FIND_FIRST2 response parameters.
 	respParams := make([]byte, 10)
-	binary.LittleEndian.PutUint16(respParams[0:2], 0x0001) // SID
-	binary.LittleEndian.PutUint16(respParams[2:4], 1)      // SearchCount
-	binary.LittleEndian.PutUint16(respParams[4:6], 1)      // EndOfSearch
-	return buildTrans2Response(req, respParams, entryData)
+	le.PutUint16(respParams[0:], 0x0001) // SID
+	le.PutUint16(respParams[2:], 1)      // SearchCount
+	le.PutUint16(respParams[4:], 1)      // EndOfSearch
+	return buildTrans2Response(req, respParams, entryData), statusOK
 }
 
+// buildTrans2Response wraps parameters and data in a TRANSACTION2 response
+// ([MS-CIFS] 2.2.4.46): ParameterCount at 6, ParameterOffset at 8, DataCount at 12
+// and DataOffset at 14, with the totals repeated at 0 and 2. Offsets count from the
+// start of the SMB header.
 func buildTrans2Response(req *smbPacket, transParams, transData []byte) *smbPacket {
-	if transParams == nil {
-		transParams = []byte{}
-	}
-	if transData == nil {
-		transData = []byte{}
-	}
-
 	resp := newResponse(req)
 
 	// WordCount = 10 (20 bytes).
 	words := make([]byte, 20)
-	binary.LittleEndian.PutUint16(words[0:2], uint16(len(transParams)))
-	binary.LittleEndian.PutUint16(words[2:4], uint16(len(transData)))
-	binary.LittleEndian.PutUint16(words[6:8], uint16(len(transParams)))
+	le.PutUint16(words[0:], uint16(len(transParams)))
+	le.PutUint16(words[2:], uint16(len(transData)))
+	le.PutUint16(words[6:], uint16(len(transParams)))
 
 	// ParameterOffset: header(32) + WC(1) + words(20) + BC(2) + pad(1) = 56.
-	paramOffset := 56
-	binary.LittleEndian.PutUint16(words[8:10], uint16(paramOffset))
+	const paramOffset = smb1HeaderSize + 1 + 20 + 2 + 1
+	le.PutUint16(words[8:], paramOffset)
 
-	binary.LittleEndian.PutUint16(words[12:14], uint16(len(transData)))
+	le.PutUint16(words[12:], uint16(len(transData)))
 
 	// DataOffset: after params, with alignment padding.
 	dataOffset := paramOffset + len(transParams)
@@ -275,13 +256,12 @@ func buildTrans2Response(req *smbPacket, transParams, transData []byte) *smbPack
 		dataPad = 1
 		dataOffset++
 	}
-	binary.LittleEndian.PutUint16(words[14:16], uint16(dataOffset))
+	le.PutUint16(words[14:], uint16(dataOffset))
 	resp.words = words
 
 	// Data section: pad(1) + transParams + dataPad + transData.
 	data := make([]byte, 1+len(transParams)+dataPad+len(transData))
-	data[0] = 0x00 // alignment pad
-	copy(data[1:1+len(transParams)], transParams)
+	copy(data[1:], transParams)
 	copy(data[1+len(transParams)+dataPad:], transData)
 	resp.data = data
 

@@ -7,7 +7,6 @@ import (
 	"log"
 	"slices"
 	"strings"
-	"time"
 )
 
 // CREATE dispositions.
@@ -31,14 +30,6 @@ const accessWriteMask = 0x00000002 | 0x00000004 | 0x00000010 | 0x00000040 | 0x00
 	0x00010000 | 0x00040000 | 0x00080000 | 0x10000000 | 0x40000000
 
 const (
-	fileActionOpened = 1
-
-	allocationUnit     = 4096
-	sectorsPerUnit     = 8
-	bytesPerSector     = 512
-	fsAttributeName    = "FAT"
-	maxFileNameLength  = 255
-	fileDeviceDisk     = 0x00000007
 	deviceReadOnly     = 0x00000002
 	fsCasePreserved    = 0x00000002
 	fsUnicodeOnDisk    = 0x00000004
@@ -64,6 +55,7 @@ type smb2Attrs struct {
 	index      uint64
 }
 
+// attrs returns the metadata of the root directory or the file.
 func (c *smb2Conn) attrs(isDir bool) smb2Attrs {
 	a := smb2Attrs{
 		isDir:      true,
@@ -82,25 +74,23 @@ func (c *smb2Conn) attrs(isDir bool) smb2Attrs {
 	return a
 }
 
-// putTimes writes the four timestamps of the common file information layout.
-func (a smb2Attrs) putTimes(b []byte) {
-	for i := 0; i < 4; i++ {
-		le.PutUint64(b[8*i:], a.time)
-	}
-}
-
 // --- CREATE ---
 
-func (c *smb2Conn) handleCreate(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleCreate runs create and remembers its status, because the related requests
+// after a failed CREATE fail with the same status.
+func (c *smb2Conn) handleCreate(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	out, status := c.create(req, out)
-	c.compound.createStatus = 0
-	if status != statusOK {
-		c.compound.createStatus = status
-	}
+	c.compound.createStatus = status
 	return out, status
 }
 
-func (c *smb2Conn) create(req *smb2Request, out []byte) ([]byte, uint32) {
+// create handles CREATE ([MS-SMB2] 2.2.13). It reads DesiredAccess at 24,
+// CreateDisposition at 36, CreateOptions at 40, NameOffset at 44 and NameLength at
+// 46; create contexts are ignored and none are returned. The response (2.2.14) holds
+// CreateAction at 4, the timestamps at 8, AllocationSize at 40, EndofFile at 48,
+// FileAttributes at 56 and the FileId at 64. Every request that could modify
+// something fails with ACCESS_DENIED, so a client never gets a writable handle.
+func (c *smb2Conn) create(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	b := req.body
 	desiredAccess := le.Uint32(b[24:])
 	disposition := le.Uint32(b[36:])
@@ -153,7 +143,7 @@ func (c *smb2Conn) create(req *smb2Request, out []byte) ([]byte, uint32) {
 	out, r := growZero(out, 88)
 	le.PutUint16(r[0:], 89) // StructureSize
 	le.PutUint32(r[4:], fileActionOpened)
-	a.putTimes(r[8:])
+	putTimes(r[8:], a.time)
 	le.PutUint64(r[40:], uint64(a.allocation))
 	le.PutUint64(r[48:], uint64(a.size))
 	le.PutUint32(r[56:], a.attributes)
@@ -163,7 +153,9 @@ func (c *smb2Conn) create(req *smb2Request, out []byte) ([]byte, uint32) {
 
 // --- CLOSE ---
 
-func (c *smb2Conn) handleClose(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleClose handles CLOSE ([MS-SMB2] 2.2.15). It reads Flags at 2 and FileId at 8.
+// The response (2.2.16) carries attributes only if POSTQUERY_ATTRIB asks for them.
+func (c *smb2Conn) handleClose(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	h := c.lookupHandle(req, req.body[8:24])
 	if h == nil {
 		return out, statusFileClosed
@@ -176,7 +168,7 @@ func (c *smb2Conn) handleClose(req *smb2Request, out []byte) ([]byte, uint32) {
 	if flags&closeFlagPostQuery != 0 {
 		a := c.attrs(h.isDir)
 		le.PutUint16(r[2:], closeFlagPostQuery)
-		a.putTimes(r[8:])
+		putTimes(r[8:], a.time)
 		le.PutUint64(r[40:], uint64(a.allocation))
 		le.PutUint64(r[48:], uint64(a.size))
 		le.PutUint32(r[56:], a.attributes)
@@ -186,7 +178,11 @@ func (c *smb2Conn) handleClose(req *smb2Request, out []byte) ([]byte, uint32) {
 
 // --- READ ---
 
-func (c *smb2Conn) handleRead(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleRead handles READ ([MS-SMB2] 2.2.19). It reads Length at 4, Offset at 8, FileId
+// at 16 and MinimumCount at 32. The file data goes directly behind the 16 bytes of the
+// response header (2.2.20: DataOffset at 2, DataLength at 4) in out, so that a read
+// copies nothing. Length is limited to the MaxReadSize announced in NEGOTIATE.
+func (c *smb2Conn) handleRead(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	length := le.Uint32(req.body[4:])
 	offset := le.Uint64(req.body[8:])
 	minimum := le.Uint32(req.body[32:])
@@ -213,14 +209,9 @@ func (c *smb2Conn) handleRead(req *smb2Request, out []byte) ([]byte, uint32) {
 	clear(out[start : start+headerSize])
 	data := out[start+headerSize:]
 
-	var ioStart time.Time
-	if c.srv.debug != nil {
-		ioStart = time.Now()
-	}
+	ioStart := c.srv.debug.now()
 	n, err := c.srv.share.ReadAt(data, int64(offset))
-	if c.srv.debug != nil {
-		c.ioNs += time.Since(ioStart).Nanoseconds()
-	}
+	c.ioNs += c.srv.debug.elapsedNs(ioStart)
 	if err != nil && !errors.Is(err, io.EOF) {
 		log.Printf("[%s] ReadAt error at offset %d: %v", c.remote, offset, err)
 		return out, statusUnexpectedIOError
@@ -244,7 +235,9 @@ func (c *smb2Conn) handleRead(req *smb2Request, out []byte) ([]byte, uint32) {
 
 // --- IOCTL ---
 
-func (c *smb2Conn) handleIoctl(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleIoctl handles IOCTL ([MS-SMB2] 2.2.31), reading CtlCode at 4. DFS referrals
+// are refused with the status that tells clients this is not a DFS server.
+func (c *smb2Conn) handleIoctl(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	code := le.Uint32(req.body[4:])
 	switch code {
 	case fsctlValidateNegotiateInfo:
@@ -257,9 +250,12 @@ func (c *smb2Conn) handleIoctl(req *smb2Request, out []byte) ([]byte, uint32) {
 	}
 }
 
-// validateNegotiate answers VALIDATE_NEGOTIATE_INFO. As specified, a client whose
-// values differ from its NEGOTIATE loses the connection.
-func (c *smb2Conn) validateNegotiate(req *smb2Request, out []byte) ([]byte, uint32) {
+// validateNegotiate answers VALIDATE_NEGOTIATE_INFO ([MS-SMB2] 2.2.31.4). The input
+// holds Capabilities at 0, Guid at 4, SecurityMode at 20, DialectCount at 22 and
+// Dialects at 24; the IOCTL fields used are InputOffset at 24, InputCount at 28 and
+// MaxOutputResponse at 44. As specified, a client whose values differ from its
+// NEGOTIATE loses the connection. The response is laid out in 2.2.32 and 2.2.32.6.
+func (c *smb2Conn) validateNegotiate(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	input, ok := req.payload(le.Uint32(req.body[24:]), le.Uint32(req.body[28:]))
 	if !ok || len(input) < 24 {
 		return out, statusInvalidParameter
@@ -283,7 +279,7 @@ func (c *smb2Conn) validateNegotiate(req *smb2Request, out []byte) ([]byte, uint
 			[16]byte(input[4:20]) != info.guid ||
 			le.Uint16(input[20:]) != info.securityMode ||
 			chooseSMB2Dialect(offered) != c.dialect {
-			c.fatal = fmt.Errorf("%w: VALIDATE_NEGOTIATE_INFO does not match NEGOTIATE", errSMB2Protocol)
+			c.fatal = fmt.Errorf("%w: VALIDATE_NEGOTIATE_INFO does not match NEGOTIATE", errProtocolViolation)
 			return out, statusAccessDenied
 		}
 	}
@@ -342,7 +338,11 @@ const (
 	fileFsFullSizeInformation  = 7
 )
 
-func (c *smb2Conn) handleQueryInfo(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleQueryInfo handles QUERY_INFO ([MS-SMB2] 2.2.37). It reads InfoType at 2,
+// FileInfoClass at 3, OutputBufferLength at 4 and FileId at 24. A buffer below the
+// fixed part of the class fails; one that only cuts off the variable part gets the
+// truncated data with BUFFER_OVERFLOW.
+func (c *smb2Conn) handleQueryInfo(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	infoType := req.body[2]
 	class := req.body[3]
 	maxOutput := le.Uint32(req.body[4:])
@@ -371,7 +371,7 @@ func (c *smb2Conn) handleQueryInfo(req *smb2Request, out []byte) ([]byte, uint32
 		return out, statusInfoLengthMismatch
 	}
 
-	status := uint32(statusOK)
+	status := statusOK
 	if uint64(len(data)) > uint64(maxOutput) {
 		data = data[:maxOutput]
 		status = statusBufferOverflow
@@ -379,7 +379,9 @@ func (c *smb2Conn) handleQueryInfo(req *smb2Request, out []byte) ([]byte, uint32
 	return appendDataBody(out, data), status
 }
 
-// appendDataBody appends the response layout shared by QUERY_INFO and QUERY_DIRECTORY.
+// appendDataBody appends the response layout shared by QUERY_INFO and QUERY_DIRECTORY
+// ([MS-SMB2] 2.2.38 and 2.2.34): StructureSize, OutputBufferOffset at 2 and
+// OutputBufferLength at 4.
 func appendDataBody(out, data []byte) []byte {
 	const bufferOffset = 8
 	out, r := growZero(out, bufferOffset+len(data))
@@ -390,13 +392,13 @@ func appendDataBody(out, data []byte) []byte {
 	return out
 }
 
-// fileInfo returns the requested file information and its fixed part's size, or
-// nil for an unsupported class.
+// fileInfo returns the requested file information ([MS-FSCC] 2.4) and its fixed
+// part's size, or nil for an unsupported class.
 func (c *smb2Conn) fileInfo(h *smb2Handle, class byte) ([]byte, int) {
 	a := c.attrs(h.isDir)
 
 	basic := func(b []byte) {
-		a.putTimes(b)
+		putTimes(b, a.time)
 		le.PutUint32(b[32:], a.attributes)
 	}
 	standard := func(b []byte) {
@@ -448,7 +450,7 @@ func (c *smb2Conn) fileInfo(h *smb2Handle, class byte) ([]byte, int) {
 		return b, fixed
 	case fileNetworkOpenInformation:
 		b := make([]byte, 56)
-		a.putTimes(b)
+		putTimes(b, a.time)
 		le.PutUint64(b[32:], uint64(a.allocation))
 		le.PutUint64(b[40:], uint64(a.size))
 		le.PutUint32(b[48:], a.attributes)
@@ -461,8 +463,8 @@ func (c *smb2Conn) fileInfo(h *smb2Handle, class byte) ([]byte, int) {
 	return nil, 0
 }
 
-// fsInfo returns the requested filesystem information and its fixed part's size,
-// or nil for an unsupported class.
+// fsInfo returns the requested filesystem information ([MS-FSCC] 2.5) and its fixed
+// part's size, or nil for an unsupported class.
 func (c *smb2Conn) fsInfo(class byte) ([]byte, int) {
 	// Never report zero units: clients divide by the size.
 	units := max(uint64(c.srv.share.Size()+allocationUnit-1)/allocationUnit, 1)
@@ -506,8 +508,6 @@ func (c *smb2Conn) fsInfo(class byte) ([]byte, int) {
 	return nil, 0
 }
 
-const volumeLabel = "IPMI CD Share"
-
 // --- QUERY_DIRECTORY ---
 
 const (
@@ -515,7 +515,11 @@ const (
 	queryDirReopen       = 0x10
 )
 
-func (c *smb2Conn) handleQueryDirectory(req *smb2Request, out []byte) ([]byte, uint32) {
+// handleQueryDirectory handles QUERY_DIRECTORY ([MS-SMB2] 2.2.33). It reads
+// FileInformationClass at 2, Flags at 3, FileId at 8, FileNameOffset at 24,
+// FileNameLength at 26 and OutputBufferLength at 28. The root holds just the file, so
+// the first query returns it and later ones NO_MORE_FILES until a restart.
+func (c *smb2Conn) handleQueryDirectory(req *smb2Request, out []byte) ([]byte, ntStatus) {
 	class := req.body[2]
 	flags := req.body[3]
 	maxOutput := le.Uint32(req.body[28:])
@@ -554,8 +558,8 @@ func (c *smb2Conn) handleQueryDirectory(req *smb2Request, out []byte) ([]byte, u
 	return appendDataBody(out, entry), statusOK
 }
 
-// directoryEntry builds the file's directory entry, or returns nil for an
-// unsupported class. All classes except FileNames start with the same 64 bytes.
+// directoryEntry builds the file's directory entry ([MS-FSCC] 2.4), or returns nil
+// for an unsupported class. All classes except FileNames start with the same 64 bytes.
 func (c *smb2Conn) directoryEntry(class byte) []byte {
 	a := c.attrs(false)
 	name := encodeUTF16LE(c.srv.share.Name())
@@ -585,7 +589,7 @@ func (c *smb2Conn) directoryEntry(class byte) []byte {
 	}
 
 	b := make([]byte, nameOffset+len(name))
-	a.putTimes(b[8:])
+	putTimes(b[8:], a.time)
 	le.PutUint64(b[40:], uint64(a.size))
 	le.PutUint64(b[48:], uint64(a.allocation))
 	le.PutUint32(b[56:], a.attributes)

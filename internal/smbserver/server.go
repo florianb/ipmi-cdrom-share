@@ -1,5 +1,3 @@
-// Package smbserver implements a minimal read-only SMB server that offers one
-// file to guests. It speaks SMB1 (NT LM 0.12) and SMB 2.0.2 through 3.0.2.
 package smbserver
 
 import (
@@ -17,6 +15,11 @@ import (
 // ErrUnknownProtocol reports a frame that is neither SMB1 nor SMB2.
 var ErrUnknownProtocol = errors.New("unknown SMB protocol identifier")
 
+// errProtocolViolation reports a client violating the protocol badly enough that
+// the connection has to be dropped.
+var errProtocolViolation = errors.New("SMB protocol violation")
+
+// protocol is the SMB generation of a message or connection.
 type protocol int
 
 const (
@@ -28,9 +31,9 @@ const (
 func identifyProtocol(frame []byte) (protocol, error) {
 	if len(frame) >= 4 {
 		switch [4]byte(frame[:4]) {
-		case [4]byte{0xFF, 'S', 'M', 'B'}:
+		case smb1Magic:
 			return protoSMB1, nil
-		case [4]byte{0xFE, 'S', 'M', 'B'}:
+		case smb2Magic:
 			return protoSMB2, nil
 		}
 	}
@@ -46,9 +49,14 @@ type Server struct {
 	debug      *debugStats // nil unless debug output is enabled
 }
 
-// NewServer returns a Server for share. With debug set it logs every SMB2
-// command and prints performance statistics.
-func NewServer(share *Share, debug bool) (*Server, error) {
+// Options configures a Server.
+type Options struct {
+	// Debug logs every SMB2 command and prints performance statistics.
+	Debug bool
+}
+
+// NewServer returns a Server for share.
+func NewServer(share *Share, opts Options) (*Server, error) {
 	s := &Server{
 		share: share,
 		progress: &progress{
@@ -56,13 +64,13 @@ func NewServer(share *Share, debug bool) (*Server, error) {
 			fileName:  share.Name(),
 			events:    make(chan readEvent, 4096),
 			done:      make(chan struct{}),
-			debugMode: debug,
+			debugMode: opts.Debug,
 		},
 	}
 	if _, err := rand.Read(s.serverGUID[:]); err != nil {
 		return nil, fmt.Errorf("generate server GUID: %w", err)
 	}
-	if debug {
+	if opts.Debug {
 		s.debug = &debugStats{}
 	}
 	return s, nil
@@ -145,10 +153,14 @@ type connState struct {
 	w      io.Writer
 	remote string
 	proto  protocol // set once a NEGOTIATE has fixed the protocol
-	smb1   *session
+	smb1   *smb1Session
 	smb2   *smb2Conn
 }
 
+// handleConn serves one connection until the client leaves, a protocol violation
+// occurs or ctx is cancelled, which closes the connection to unblock the read.
+// Frame types other than session messages and session requests are ignored,
+// which covers the keep-alive (0x85).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -171,9 +183,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	log.Printf("[%s] Connected", remote)
 	defer log.Printf("[%s] Disconnected", remote)
 
-	s.progress.mu.Lock()
-	s.progress.client = clientIP
-	s.progress.mu.Unlock()
+	s.progress.setClient(clientIP)
 
 	c := &connState{
 		w:      conn,
@@ -226,7 +236,7 @@ func (c *connState) handleFrame(frame []byte) error {
 	switch proto {
 	case protoSMB1:
 		if c.proto == protoSMB2 {
-			return fmt.Errorf("%w: SMB1 frame on SMB2 connection", errSMB2Protocol)
+			return fmt.Errorf("%w: SMB1 frame on SMB2 connection", errProtocolViolation)
 		}
 		req, err := parseSMBPacket(frame)
 		if err != nil {
@@ -243,7 +253,7 @@ func (c *connState) handleFrame(frame []byte) error {
 		return c.smb1.serve(c.w, req)
 	case protoSMB2:
 		if c.proto == protoSMB1 {
-			return fmt.Errorf("%w: SMB2 frame on SMB1 connection", errSMB2Protocol)
+			return fmt.Errorf("%w: SMB2 frame on SMB1 connection", errProtocolViolation)
 		}
 		c.proto = protoSMB2
 		return c.smb2.serveFrame(c.w, frame)
